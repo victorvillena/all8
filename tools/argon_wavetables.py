@@ -17,6 +17,7 @@ How the stock firmware works (see NOTES.md, "Wavetables"):
     The build rewrites the entries of replaced banks in place.
 
 Usage:
+  argon_wavetables.py list <Argon8 syx dir>
   argon_wavetables.py extract <Argon8 syx dir> <out dir>
   argon_wavetables.py build <Argon8 syx dir> <out dir> --bank 0x18=table.wav [--name 0x18="Glass"]
                             [--bank 0x19=a.wav,b.wav,c.wav,d.wav,e.wav]
@@ -26,6 +27,7 @@ spaced frames are taken; override with --frame-size) or 5 comma-separated single
 `--name` names a replaced bank. Banks without a name are called "Custom WT 1", "Custom WT 2", … in
 bank order, skipping names already in use. Names must be unique among all banks (case-insensitive).
 The build writes a complete flashable set (patched panel + slave, stock master) to <out dir>.
+`list` shows the name, waves and display copy of every bank in a stock set or one built by this tool.
 """
 import argparse
 import cmath
@@ -139,6 +141,28 @@ PANEL_FLASH_PAGE = 512  # SAM4E flash page size
 # The factory entries match b = round((sample / 32767 + 1) * 31) taken at every 8th sample.
 PREVIEW_TABLE = 0x44AAA8
 PREVIEW_POINTS = 128
+
+# For `list`: stock image sizes, SHA-256 of the stock images with every region a build may change zeroed
+# (see masked_slave / masked_panel), so built sets are recognized too, and per stored bank the truncated
+# SHA-256 of its factory samples (5 x 1024 int16) and of its factory display entries (5 x 128 bytes).
+SLAVE_SIZE = 0x89B00
+PANEL_SIZE = 0x46E00
+SLAVE_MASKED_SHA256 = "a465866d68e3e53a2448c10d76545c877a0bd0caf951a609e2f36739f98b2edc"
+PANEL_MASKED_SHA256 = "e703a77ccfbf55235f0f53f559b4c446216fb7dd24c7db52704c6bd7308312e9"
+FACTORY_DIGESTS = {
+    0x18: ("c50635eb72a1755c", "d4cbc31e21e313c1"),
+    0x19: ("66e3046fa82d0e9a", "f2d0c46cbab20f46"),
+    0x1a: ("6ba32ad0ac78e01e", "c24e17912cbab58b"),
+    0x1b: ("fc744349b5e33dfb", "d189c828f13d6b93"),
+    0x1c: ("dc1fa1c70e7ec08e", "17dd5402f1fcf05c"),
+    0x1d: ("4a475e5aa805c09c", "16e3627a00ac971f"),
+    0x1e: ("34c568e6a52e8172", "7abf53374c2c2c63"),
+    0x1f: ("a1667e18a7de1832", "adc9041eaeeb3b5c"),
+    0x20: ("56ae9f6c6cac30a6", "c771da1ff68b2fae"),
+    0x21: ("0ed94b95ccfcd3d8", "454d59cb6698950f"),
+    0x22: ("4b2b171f67533691", "c1758db1ef8758f9"),
+    0x23: ("526454a5d7611794", "837e8a9d4f9228dc"),
+}
 
 
 # --- WAV I/O ---------------------------------------------------------------------------------------
@@ -268,13 +292,13 @@ def find_component(src_dir, role):
     sys.exit(f"no *_{role}_*.syx in {src_dir}")
 
 
-def load_component(src_dir, role, target, sha256):
+def load_component(src_dir, role, target, sha256, fingerprint=bytes, what="the Argon8 3.2 {role}"):
     path = find_component(src_dir, role)
     dev, tgt, image, bad = modal_fw.decode(open(path, "rb").read())
     if bad or dev != 0x18 or tgt != target:
         sys.exit(f"{path}: not a clean Argon8 {role} image")
-    if hashlib.sha256(image).hexdigest() != sha256:
-        sys.exit(f"{path}: not the Argon8 3.2 {role} this tool was mapped against (SHA-256 mismatch)")
+    if hashlib.sha256(fingerprint(image)).hexdigest() != sha256:
+        sys.exit(f"{path}: not {what.format(role=role)} this tool was mapped against (SHA-256 mismatch)")
     return path, bytearray(image)
 
 
@@ -284,6 +308,34 @@ def load_slave(src_dir):
 
 def load_panel(src_dir):
     return load_component(src_dir, "panel", 0, PANEL_SHA256)
+
+
+def masked_slave(image):
+    """The slave image with every wave's samples and literal zeroed."""
+    out = bytearray(image)
+    for addr, lit in WAVES.values():
+        out[addr - BASE:addr - BASE + 2 * FRAME] = bytes(2 * FRAME)
+        if lit is not None and lit not in SHARED_LITERALS:
+            out[lit - BASE:lit - BASE + 4] = bytes(4)
+    return bytes(out) if len(out) == SLAVE_SIZE else b""
+
+
+def masked_panel(panel):
+    """The stock-sized part of the panel image with the name hook and the wave display table zeroed."""
+    out = bytearray(panel[:PANEL_SIZE])
+    out[NAME_HOOK - BASE:NAME_HOOK - BASE + 4] = bytes(4)
+    table = PREVIEW_TABLE - BASE
+    out[table:table + len(STOCK_NAMES) * WAVES_PER_BANK * PREVIEW_POINTS] = bytes(
+        len(STOCK_NAMES) * WAVES_PER_BANK * PREVIEW_POINTS)
+    return bytes(out)
+
+
+def load_any(src_dir):
+    """Load the slave and panel of a stock Argon8 3.2 set or of one built by this tool."""
+    what = "the Argon8 3.2 {role} (or a build of it)"
+    _, image = load_component(src_dir, "slave", 2, SLAVE_MASKED_SHA256, masked_slave, what)
+    _, panel = load_component(src_dir, "panel", 0, PANEL_MASKED_SHA256, masked_panel, what)
+    return image, panel
 
 
 def read_wave(image, bank, wave):
@@ -302,12 +354,20 @@ def write_wave(image, bank, wave, frame):
     return frame
 
 
-def check_literals(image):
+def literal_mismatches(image):
+    """(bank, wave) pairs whose folded first-sample literal disagrees with the stored sample 0."""
+    bad = []
     for (bank, wave), (addr, lit) in WAVES.items():
         if lit is not None:
             s0 = struct.unpack_from("<h", image, addr - BASE)[0]
             if struct.unpack_from("<i", image, lit - BASE)[0] != s0:
-                raise AssertionError(f"bank {bank:#x} wave {wave}: literal does not match sample 0")
+                bad.append((bank, wave))
+    return bad
+
+
+def check_literals(image):
+    for bank, wave in literal_mismatches(image):
+        raise AssertionError(f"bank {bank:#x} wave {wave}: literal does not match sample 0")
 
 
 # --- bank names ----------------------------------------------------------------------------------------
@@ -348,12 +408,19 @@ def assign_names(banks, requested):
     return names
 
 
+def preview_points(frame):
+    step = FRAME // PREVIEW_POINTS
+    return bytes(max(0, min(62, round((frame[i * step] / 32767 + 1) * 31))) for i in range(PREVIEW_POINTS))
+
+
+def preview_offset(bank, wave=0):
+    return PREVIEW_TABLE - BASE + (bank * WAVES_PER_BANK + wave) * PREVIEW_POINTS
+
+
 def write_preview(panel, bank, wave, frame):
     """Replace the panel's 128-point display copy of one wave."""
-    step = FRAME // PREVIEW_POINTS
-    points = bytes(max(0, min(62, round((frame[i * step] / 32767 + 1) * 31))) for i in range(PREVIEW_POINTS))
-    off = PREVIEW_TABLE - BASE + (bank * WAVES_PER_BANK + wave) * PREVIEW_POINTS
-    panel[off:off + PREVIEW_POINTS] = points
+    off = preview_offset(bank, wave)
+    panel[off:off + PREVIEW_POINTS] = preview_points(frame)
 
 
 def thumb_b_cond(cond, src, dst):
@@ -391,6 +458,24 @@ def stock_name_addresses(panel):
     return addrs
 
 
+def name_stub(stub, table):
+    """The 32-byte name lookup stub placed at stub, reading the name pointer table at table."""
+    code = bytearray()
+    code += bytes.fromhex("232b")             # cmp   r3, #0x23
+    code += bytes.fromhex("09d8")             # bhi   fallback (stub+24)
+    code += bytes.fromhex("054a")             # ldr   r2, [pc, #20]  -> table address (stub+28)
+    code += bytes.fromhex("52f82320")         # ldr.w r2, [r2, r3, lsl #2]
+    code += bytes.fromhex("12f8011b")         # 1: ldrb r1, [r2], #1
+    code += bytes.fromhex("04f8011b")         #    strb r1, [r4], #1
+    code += bytes.fromhex("0029")             #    cmp  r1, #0
+    code += bytes.fromhex("f9d1")             #    bne  1b
+    code += bytes.fromhex("70bd")             # pop   {r4, r5, r6, pc}
+    code += thumb_b(stub + len(code), NAME_BRANCH)  # fallback: original branch (Osc2 extras, blanks)
+    code += struct.pack("<I", table)
+    assert len(code) == 32
+    return code
+
+
 def patch_panel_names(panel, names):
     """Append a name stub + table to the panel image and hook the bank-name branch into it."""
     if panel[NAME_HOOK - BASE:NAME_HOOK - BASE + 4] != NAME_HOOK_ORIGINAL:
@@ -406,27 +491,65 @@ def patch_panel_names(panel, names):
         else:
             entries.append(table + 4 * len(names) + len(strings))
             strings += name.encode() + b"\0"
-    code = bytearray()
-    code += bytes.fromhex("232b")             # cmp   r3, #0x23
-    code += bytes.fromhex("09d8")             # bhi   fallback (stub+24)
-    code += bytes.fromhex("054a")             # ldr   r2, [pc, #20]  -> table address (stub+28)
-    code += bytes.fromhex("52f82320")         # ldr.w r2, [r2, r3, lsl #2]
-    code += bytes.fromhex("12f8011b")         # 1: ldrb r1, [r2], #1
-    code += bytes.fromhex("04f8011b")         #    strb r1, [r4], #1
-    code += bytes.fromhex("0029")             #    cmp  r1, #0
-    code += bytes.fromhex("f9d1")             #    bne  1b
-    code += bytes.fromhex("70bd")             # pop   {r4, r5, r6, pc}
-    code += thumb_b(stub + len(code), NAME_BRANCH)  # fallback: original branch (Osc2 extras, blanks)
-    code += struct.pack("<I", table)
-    assert len(code) == 32
-    panel += code + struct.pack(f"<{len(entries)}I", *entries) + strings
+    panel += name_stub(stub, table) + struct.pack(f"<{len(entries)}I", *entries) + strings
     # The stock Argon panel is a whole number of 512-byte flash pages. Keep it that way so the new code
     # never sits in a partial final page (the panel bootloader's handling of one is untested).
     panel += bytes(-len(panel) % PANEL_FLASH_PAGE)
     panel[NAME_HOOK - BASE:NAME_HOOK - BASE + 4] = thumb_b_cond(0x9, NAME_HOOK, stub)  # bls.w stub
 
 
+def read_panel_names(panel):
+    """Return (bank names, whether the panel carries this tool's name patch)."""
+    hook = panel[NAME_HOOK - BASE:NAME_HOOK - BASE + 4]
+    if hook == NAME_HOOK_ORIGINAL:
+        return list(STOCK_NAMES), False
+    stub = BASE + PANEL_SIZE
+    if hook != thumb_b_cond(0x9, NAME_HOOK, stub) or len(panel) < PANEL_SIZE + 32:
+        sys.exit("panel: the bank-name hook holds an instruction this tool did not write")
+    table = struct.unpack_from("<I", panel, stub + 28 - BASE)[0]
+    if panel[stub - BASE:stub - BASE + 32] != name_stub(stub, table):
+        sys.exit("panel: the bank-name stub is not the one this tool writes")
+    names = []
+    for bank in range(len(STOCK_NAMES)):
+        off = struct.unpack_from("<I", panel, table - BASE + 4 * bank)[0] - BASE
+        end = panel.find(b"\0", off) if 0 <= off < len(panel) else -1
+        if end < 0:
+            sys.exit(f"panel: bank {bank:#04x} name pointer is out of range")
+        names.append(panel[off:end].decode("latin-1"))
+    return names, True
+
+
 # --- commands ----------------------------------------------------------------------------------------
+
+def short_digest(data):
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def cmd_list(a):
+    image, panel = load_any(a.src)
+    names, patched = read_panel_names(panel)
+    bad_literals = {bank for bank, _ in literal_mismatches(image)}
+    print(f"{a.src}: Argon8 3.2, {'custom' if patched else 'factory'} bank names")
+    print(f"{'bank':<6}{'name':<{NAME_MAX + 2}}{'waves':<10}display")
+    for bank, name in enumerate(names):
+        if bank not in BANKS:
+            print(f"{bank:#04x}  {name:<{NAME_MAX + 2}}{'built-in':<10}")
+            continue
+        frames = [read_wave(image, bank, w) for w in range(WAVES_PER_BANK)]
+        samples = b"".join(struct.pack(f"<{FRAME}h", *f) for f in frames)
+        preview = bytes(panel[preview_offset(bank):preview_offset(bank + 1)])
+        factory_waves, factory_preview = FACTORY_DIGESTS[bank]
+        waves = "factory" if short_digest(samples) == factory_waves else "custom"
+        if preview == b"".join(preview_points(f) for f in frames):
+            display = "matches waves"
+        elif short_digest(preview) == factory_preview:
+            display = "factory" + (" (does not match waves)" if waves == "custom" else "")
+        else:
+            display = "does not match waves"
+        if bank in bad_literals:
+            display += "; first-sample literal mismatch"
+        print(f"{bank:#04x}  {name:<{NAME_MAX + 2}}{waves:<10}{display}")
+
 
 def cmd_extract(a):
     _, image = load_slave(a.src)
@@ -486,6 +609,8 @@ def cmd_build(a):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    ls = sub.add_parser("list", help="show the name, waves and display copy of every bank")
+    ls.add_argument("src", help="directory with a stock Argon8 3.2 set or one written by build")
     e = sub.add_parser("extract", help="dump the 12 stored banks as WAV files")
     e.add_argument("src", help="directory with the stock Argon8 3.2 .syx files")
     e.add_argument("out")
@@ -500,7 +625,7 @@ def main():
     b.add_argument("--frame-size", type=int, help="samples per frame in a multi-frame WAV")
     b.add_argument("--no-normalize", action="store_true", help="keep input level instead of peak-normalizing")
     a = ap.parse_args()
-    {"extract": cmd_extract, "build": cmd_build}[a.cmd](a)
+    {"list": cmd_list, "extract": cmd_extract, "build": cmd_build}[a.cmd](a)
 
 
 if __name__ == "__main__":

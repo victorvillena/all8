@@ -60,6 +60,10 @@ with your own waves. The firmware band-limits every wave itself, so you only pro
 The tool only accepts the stock Argon8 3.2 slave image (SHA-256 check).
 
 ```bash
+# Show what a set holds: every bank's name, whether its waves are factory or custom, and whether
+# the panel's wave display matches them. Works on the stock set and on sets written by build.
+python3 tools/argon_wavetables.py list out/
+
 # Dump the stock banks as WAV files (one file per bank, 5 frames x 1024 samples, 16-bit),
 # e.g. argon8_bank_0x18_Chew.wav
 python3 tools/argon_wavetables.py extract firmwares/argon stock_waves/
