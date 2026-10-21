@@ -108,6 +108,38 @@ rotated to start on a zero crossing, which only changes its starting phase.
 The output directory holds a complete set: the patched panel and slave plus the stock master. The
 tool only accepts the stock Argon8 3.2 panel and slave images (SHA-256 check).
 
+### `tools/carbon_cobalt.py`: Cobalt8 oscillators on Carbon8 1.1
+
+> **Status:** works on hardware (Argon8 unit crossflashed to Carbon, 2026-10-21). Builds before
+> 2026-10-21 killed the sound engine as soon as a Cobalt Core was selected (uninitialised RAM, see
+> NOTES.md, "Cobalt oscillators on Carbon"); rebuild any set made earlier.
+
+Builds a Carbon8 1.1 set in which the 40 Cobalt8 2.1 oscillator algorithms are extra Cores:
+
+```bash
+python3 tools/carbon_cobalt.py build firmwares/carbon firmwares/cobalt out/
+python3 tools/carbon_cobalt.py cores      # Core number of each Cobalt algorithm
+```
+
+- Cores 0–55 are Carbon's own. Cores 56–95 are Cobalt's algorithms in Cobalt's order (56 VA Sweep …
+  95 Filt Noise), named as on the Cobalt8.
+- Each oscillator's **Contour** is the algorithm's Param A. When you edit it on a Cobalt Core, the
+  screen shows the algorithm's own name for it (Shape, Sync, Width, …).
+- A new **Param B** entry follows Contour in the Osc1 and Osc2 menus (patch bytes +0x66/+0x67, saved with
+  the patch). On a Cobalt Core it is titled with the algorithm's name for it (Spread, Sub, Asym, …).
+- Level, XMod, XCore, Drift, the mod matrix and the filters work on Cobalt Cores as on Carbon's. Contour
+  modulation reaches Param A; Param B has no mod destination.
+- The oscillator waveform display uses Cobalt's own preview renderer. It redraws when Core or Contour
+  changes, not when only Param B changes.
+- Param B can't be recorded into the sequencer's parameter lanes and isn't touched by Randomise Patch.
+- Stock patches load unchanged (they hold 0 in +0x66/+0x67).
+
+All three components are patched. The tool needs the stock Carbon8 1.1 set and the stock Cobalt8 2.1 set
+(the Cobalt algorithms, previews and names are copied from it) and checks both by SHA-256. It uses only
+the standard library. The DSP glue is C (`tools/glue/cobalt_glue.c`), stored compiled in
+`tools/glue/cobalt_glue.json`. After editing the C, regenerate it with `python3 tools/glue/make_glue.py`
+(needs a clang with the ARM backend, such as Apple's command-line tools).
+
 ## Flashing a built set
 
 Flash with crossflash-8's flasher. It sends whatever set is in the directory, provided the set's model

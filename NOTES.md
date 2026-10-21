@@ -257,8 +257,9 @@ field: `min` is the bit position. The ID → offset mapping comes from each mast
   which won't be ported, so 128 entries are enough. Cobalt's Mix (+0x08) is dropped: Carbon keeps XMod there
   and its per-osc Levels at +0x09/+0x0A (see "Oscillator combine stage"). Parameter 2 (Cobalt Param B1/B2, Argon
   WavMod) goes in +0x66 (Osc1: B1) and +0x67 (Osc2: B2), one full 7-bit byte each, so B1 and B2 keep their
-  independent 0–127 ranges as in Cobalt (+0x09/+0x0A there). +0x67 was checked: it's usable (see above). The master
-  setter case for 0xB7 should be removed or repointed so the sequencer function can't write it.
+  independent 0–127 ranges as in Cobalt (+0x09/+0x0A there). +0x67 was checked: it's usable (see above). Nothing
+  but the new Param B record sends ID 0xB7, so B2 keeps it; B1 gets ID 0xB4 (see "Cobalt oscillators on
+  Carbon"). Implemented by `tools/carbon_cobalt.py`.
 
 ## Oscillator combine stage and XMod (Carbon 1.1 slave)
 
@@ -322,6 +323,122 @@ a Cobalt algorithm into Carbon's render switch needs:
   Wrapping the alg to take Carbon's contour array also makes XCore 5 work.
 - **State.** Cobalt's per-voice state is larger than Carbon's 0x148 slot, so it needs its own RAM. That's
   fine, since the slave has 181 KB free.
+
+## Cobalt oscillators on Carbon (`tools/carbon_cobalt.py`)
+
+Status: works on hardware (Argon8 crossflashed to Carbon, 2026-10-21) after the uninitialised-RAM fix
+below; checked in emulation (unicorn) throughout. Cores 56–95 = Cobalt algorithms 0–39; Param B per
+oscillator at +0x66 (ID **0xB4**) / +0x67 (ID **0xB7**).
+
+**Choosing the B1 ID.** It has to fall to the default case in the panel records, the master setter
+(0x431844 table), the slave setter (0x42972E), the slave CC handler's special IDs (0x42B69C: 0x01, 0x0B,
+0x74–0x78, 0x7F, 0xAC–0xAF, 0xBE, 0xBF) and the master's generic CC handler (0x44027C, a `tbh` on ID).
+That handler special-cases 0xB5 (and 0x00, 0x01, 0x0B, 0x74–0x7D, 0x7F, 0x96, 0xAB–0xB0, 0xB3, 0xB8, 0xBD,
+0xC0), which rules out the first choice. Remaining free IDs: 0x04, 0x08, 0x0A, 0x41, 0x42, 0x4A, 0x61, 0x7A,
+0x7E, **0xB4**, 0xC1. The generic path calls setter(id, val, 0) and then forwards the CC to both slave links
+(`0x42AF48(0, id, val, 1)` and `0x42AF48(4, id, val, 2)`), so any default-case ID reaches the slaves.
+
+**Master ↔ slave link.** Router 0x42AAC8(cin, msg, flags) builds a 4-byte USB-MIDI-style packet
+(byte 0 = CIN, 0xB = CC) and queues it per flag bit: bit 0 → UART1 TX ring (0x20409AF0), bit 1 → UART3 TX
+ring (+0x408), bit 2 → UART4 ring (0x20417500). Each slave uses only UART4 on its side (the same image runs on
+two slaves, 4 voices each). The slave's CC handler 0x42B800 does NRPN (0x06/0x26/0x62/0x63) itself and passes
+everything else to setter(id = cc, val). Whole patches go through the slave's own offset → ID table
+0x45278C (identical to the master's 0x452EE8) in 0x42B8A8.
+
+**Slave (Carbon 1.1).**
+- Cobalt 2.1 slave: the 40 algorithms are back to back at 0x416B44–0x439490 (switch 0x439490, case stubs
+  `ldr r4,=alg ; movs r2,#idx`). Each is `alg(out[128], voice_state, alg, osc)`, a leaf function. They read
+  12 RAM globals: patch 0x2040B7C8 (+6/+7 Param A, +9/+0xA Param B), routing 0x204000C4, audio mod buffers
+  0x2040299C/0x2040699C, bipolar flags 0x2040A99C, control mod 0x2040A9F8, "mod on" flags 0x2040AAD9 (A1),
+  0xAADA (B1), 0xAADB (A2), 0xAADC (B2), and two constant `.data` FM tables 0x20400014/0x20400054
+  (LMA 0x456DDC). Flash tables lie in 0x449CE8–0x456E80; the only calls are libgcc dsub/dadd/f2d/d2f
+  (0x4477E0/E4, 0x447AA0, 0x4480A8), byte-identical to Carbon's 0x42E098/09C/358/960. All 578 literal words
+  holding these values are relocated by value; recursive-descent analysis found exactly the same 578.
+- Voice state (0x290 per voice): 8 phase accumulators of 0x44 bytes, osc 0/1 interleaved (entry k =
+  osc + 2j). Inputs written by Cobalt's voice function every block: +0x0C increment = f·ratio/48000 (capped at
+  10 kHz → 0.2083333), ratio j = 1, 0x455D4C[B], [B+128], [B+256]. +0x234 = voice. Some algorithms rewrite
+  +0x0C, so it must be set every block. Alg change (0x4161E0) and note-on with Free Run off (0x416550)
+  clear the osc's entries and set +0x11 = 1; algorithms with 0x456970[alg] ≠ 0 also randomize sub-osc phases
+  ×0.25 unless 0x4511BC[B] ≠ 0.
+- Carbon render dispatcher 0x41A130(out, osc, voice, contour): computes the osc frequency into the state
+  (0x412594: state +0x10 = Hz after tune, pitch mod, vintage and drift; +0xE4 = voice), then calls
+  `core(state, out[256], contour[128], osc)` by Core (0x20406714[osc]). Contour arrays are 128 control values
+  without modulation; cores add it themselves: `clamp01(contour[i] + ctrl + modA[i] + depth·modB[i])` with
+  depth = clamp01(contour[0] + ctrl), inverted unless unipolar (flags 0x20410AAD/AAF, routing 0x204020B8[osc],
+  buffers 0x204109C4/0x20408964/0x2040C964). Note-on reset 0x410F88(voice) zeroes state word 0 of both oscs.
+- The glue (`tools/glue/cobalt_glue.c`) fills a Cobalt-shaped view in free RAM (0x20440000, 15.4 KB) on each
+  call: Param A goes in per sample through the mod input (flags A on, routing osc → slot osc+1) using
+  Carbon's formula above, B from +0x66/+0x67, increments from state +0x10. It detects Carbon's note-on reset
+  with a marker (it writes 0.5 to state word 0 after each call), runs the algorithm, clips to ±2, and
+  upsamples with a 16-tap halfband (−0.17 dB at 20 kHz, < −34 dB above 28 kHz; 8 input samples of delay).
+- Hooks: dispatcher 0x41A164 (Core ≥ 56 → glue), Core loader 0x411DE0 (Cores ≥ 56 only store the Core
+  and set 0x2040004C[osc]), setter entry 0x429720 (0xB4/0xB7 → +0x66/+0x67), Core clamps 0x42A1AC/0x42A1CC
+  (55 → 95), offset → ID table +0x66 = 0xB4. Code at 0x470000, tables 0x493000, glue 0x4A1000.
+- Checked: all 40 algorithms × 2 oscillators through the patched dispatcher match stock Cobalt bit for bit
+  (even samples) and the reference interpolation within 1e-5 (odd samples). Carbon Cores 0–55 render
+  identically to stock. Contour mod path, note-on reset and patch load work.
+- Cost (emulated instructions per render call, glue included): Cobalt mean 17.9k, max 25.7k (Spread Sqr);
+  Carbon Cores mean 13.7k, max 19.5k. Real cycle headroom is unknown.
+- Stock Cobalt behaviour kept: Fold Tri emits ~−3900 on the first sample after a phase reset, FM Squ/Tri Squ
+  ~1e6 for 4 samples at B 127. The ±2 clip covers these.
+- **Hardware bug (Argon8 unit with crossflashed Carbon, 2026-10-21): selecting any Cobalt Core killed the
+  sound engine for good.** Cause: the glue sets up its view on first use, keyed on `cv_magic`. Carbon's startup
+  doesn't clear 0x20440000+. clang compiled the plain `static uint32_t cv_magic` (only ever assigned MAGIC)
+  as a one-byte flag (`ldrb [0x20440000]; cmp #0`), since C lets it assume the static starts at zero. At
+  power-on, RAM is random, so the flag almost always read nonzero and the view was never set up.
+  The algorithms then indexed with garbage (voice +0x234 = 0x57 instead of 0–3) and took a BusFault.
+  The slave has no fault handler (HardFault is `bkpt`), so it stopped.
+  Fix: `static volatile uint32_t cv_magic` (full 32-bit compare). In unicorn with 0x20440000–0x20444000
+  filled randomly (3 seeds), the old build crashed on all 40 Cores and the fixed one matches the
+  zeroed-RAM output. **Any state in RAM that Carbon's startup doesn't clear must be keyed on a volatile
+  magic word**, and emulator tests should start from random RAM.
+- How it was found: flash probes showed the image was written correctly. A diagnostic build then wrapped
+  each algorithm call and replaced the fault vectors (3–6) and the XDMAC vector with handlers that record
+  the stacked frame and CFSR/BFAR to RAM that survives a reset, then unwind the call. The record was read
+  back by ear, as beeps on Cores 56–63 with Param B choosing the word. Result: BusFault (CFSR 0x8200),
+  PC 0x478BC2 in PWM Saw Erase (alg 8, `vldr s9,[r3]`), BFAR 0x203873E8, r12 = 0x57.
+  Ruled out on the way: DMA (one XDMAC channel, audio buffer 0x2045F000 only), MPU/cache attributes (RAM
+  0x20400000–0x2045FFFF is write-back, D-cache invalidated only at boot), stack depth (a full audio block
+  on a Cobalt Core needs ≤ 5.4 KB of the 8 KB stack, against 4.8 KB for Carbon), and the interrupt handlers.
+  Carbon and Cobalt slaves have identical MPU/cache/vector setup.
+
+**Master (Carbon 1.1).**
+- Setter table entry 0xB4 → stub storing +0x66; Core clamps 0x4305CA/0x430606 → 95; offset → ID +0x66 = 0xB4.
+- Other ID switches (0x430270/0x4324A0/0x43DFDA: sequencer parameter lanes; 0x43C068/0x43C760: mod-slot value
+  restore; 0x43D494/0x43D7CA/0x43F35C/0x43FB46: stack arrays) are left alone, so B1/B2 can't be recorded in
+  sequencer lanes.
+- The oscillator waveform shown on the panel is computed by the **master** (0x42DAE4, from Core, Contour and
+  per-Core tables 0x4806A4/0x452E08 of 56 entries) and sent as `F0 00 21 07 1D 7A <osc> <128 × 0–63> F7`
+  (0x42AA28). The panel requests it with CC 0xC0 (value 1/2 = osc). Cobalt's master has its own 40
+  renderers `preview(out, A, B)` (switch 0x42D41C, code 0x423C18–0x427808, leaf functions). They are copied
+  with their tables (traced over all A/B values: 0x44D4E4, 0x453CE8, 0x46D2CC–0x46F008, 0x470804–0x4710CC,
+  0x4730CC–0x4736D0), constant `.data` 0x204001B0–0x20400AB4 (LMA 0x4741E4) and 0.3 KB of scratch RAM
+  (→ 0x20452000). Hook 0x42DB24: Core ≥ 56 → Cobalt renderer → the normal send at 0x42DBD8. All 320
+  checked cases match Cobalt's output.
+- The scratch RAM isn't only written before read: 24 renderers carry state in it between calls. These are
+  58–62, 76–93 and 95 (read-before-write at e.g. 0x4867C2, 0x488144, 0x4894E6). In Cobalt it is zero at boot;
+  in Carbon's master it holds power-on garbage, which changed 103 of 120 tested previews. The hook clears
+  0x20452000–0x20452250 on first use, keyed on the word after it (`PREVIEW_MAGIC`). With random scratch
+  RAM, the previews now match the old build's zeroed-RAM output (414 cases, two calls each).
+
+**Panel (Carbon 1.1).**
+- Records are written at runtime (enable flags of #38–43), so the table stays in RAM. The tool moves it to
+  the top of the newlib heap (0x2001DC00, 267 records), lowers the `_sbrk` limit (literal 0x415430) and copies
+  it there from flash before `main` (reset handler literal 0x4152A4). References: 31 literal words of
+  0x20000678, one of 0x20001FFC (record 204 + 4), counts `movw #0x109` at 0x41B134/0x42020E.
+- Menus are `.data` halfword lists of record indices, 60-byte slots, 0xFFFF-terminated (Osc1 0x44BA8C,
+  Osc2 0x44BAC8, list at 0x44BA14 + 0x3C·n). New records 265/266 "Param B" (grp 1/2) go after Contour.
+- Value-to-text 0x41BB4C(record index, value, out): Core names (records 9/10) from 17-byte table 0x4478FC with
+  a clamp at 0x41BD6E; extended to 96 names. The title for Contour (records 2/3) comes from 13-byte table
+  0x445254 indexed by Core (literals 0x41E12C, 0x422554); extended with Cobalt's Param A names (Cobalt panel
+  0x44447C: 40 × {A name, B name}). Hook 0x421604 titles records 265/266 with the B name on Cobalt Cores.
+  Core setter clamps 0x427702/0x42771A → 95.
+- 20 ID switches (`cmp rN,#0xC3`; list in `CarbonPanel.ID_SWITCHES`) get 0xB4/0xB7 cases cloned from ID 0x12
+  (XMod, +0x08) with the offset changed: `tbh` switches through a pre-dispatch stub, the two `ldr pc` tables
+  (0x41FDE4, 0x42DB0A) by table entry.
+- Checked: boot copy, menus, names, title hook, and encoder edits of records 265/266 through the encoder
+  handler 0x42CDD0 (updates +0x66/+0x67 and sends 0xB4/0xB7 through 0x42542C and 0x425EE4 exactly as a Core
+  edit does).
 
 ## Argon8 wavetables (slave 3.2)
 
