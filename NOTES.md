@@ -175,6 +175,122 @@ Next steps for *adding* banks (instead of replacing): hook the renderer's `0x24�
 read from a table appended after 0x499B00. Then raise the panel's Bank max (record @ 0x4534B4/0x4534D4)
 and check whether the master clamps or rescales the bank value on its way to the slave.
 
+## Filters (Argon 3.2, Cobalt 2.1, Carbon 1.1 slaves)
+
+Decompiled with headless Ghidra (language `ARM:LE:32:Cortex`, TMode forced to 1, functions seeded from `bl`
+targets plus odd code pointers in literal pools). REA's raw-binary import uses the generic ARM language and
+finds only ~200 functions in these images. Only the slaves contain filter code: the keytrack constants shared
+by every engine (135.504, −0.1015522, 22.727272) are absent from the masters.
+
+**Parameters.** Panel ids are the same on both: Morph 0x21, Cutoff 0x22, Reso 0x23, Type 0x2A, Cutoff Scaling
+0xC5. Both slaves keep the patch in RAM with Type at **+0x33**, Morph +0x17, Cutoff +0x18, Reso +0x19,
+Note>Cutoff +0x58, AftT>Cutoff +0x5A, Velo>AEG +0x5B (slave setter switch, Argon 0x44796C / Cobalt 0x4430A8).
+The tail differs: Cutoff Scaling is +0x65 on Argon and +0x63 on Cobalt, Vintage +0x64 vs +0x62. Argon filters
+also read +0x02 (Distortion, id 0x0C), which Cobalt doesn't have. Type is clamped three times:
+
+| | panel max (record) | master clamp | slave clamp |
+|---|---|---|---|
+| Argon | 7 (0x4535D4) | `cmp r6,#7` @ 0x42C09C | 8 @ 0x4489B4, copied to 0x20405920 |
+| Cobalt | 30 (0x4485AC) | `cmp r6,#0x1e` @ 0x4307E0 | 30 @ 0x443AA8, then tail-calls 0x43A5E9(type) |
+
+**Sample rate.** Argon slave runs at **44.1 kHz** and Cobalt at **48 kHz**. Each image has the same
+cutoff→coefficient table generated for its own rate: Argon 0x4709BC starts 0.0002912, Cobalt 0x44C2A8 starts
+0.0002676. The ratio is 1.0882 = 48000/44100, and both start at the same ~4.09 Hz. Smoothing constants differ
+the same way (0.9997088 vs 0.9997324). The "vintage" table is byte-identical (Argon 0x48EE4C = Cobalt 0x456450).
+
+**Argon dispatch** (block function 0x442E88, 4 voices × 128 samples). Oscillators render into int16 buffers
+(0x4402F9 per voice), then:
+
+| type | name | engine | domain |
+|---|---|---|---|
+| 0, 1 | Standard, Standard Notch | 0x4340B8 (20 KB, one loop per mod-routing combination), then 0x43FD5C | Q15 fixed point, coefficients interpolated from int16 tables 0x47231C/0x458FEC/0x46DC30; state 0x48/voice @ 0x20422778 |
+| 2, 3 | Classic, Classic Notch | 0x4396D8 (8.8 KB), then 0x43FD5C | Q15; state 0x88/voice @ 0x2043ACFC |
+| 4 | Ladder | 0x43BD68 (3.8 KB) | float |
+| 5 | Ladder Hybrid | 0x43DD80 (3.8 KB) | float |
+| 6 | Ladder Phaser | 0x43CDC0 (3.7 KB) | float |
+| 7 | Sallen-Key | 0x43ED98 (2.5 KB) | float |
+| 8 | (hidden: no filter) | none | the slave accepts it but the panel max is 7 |
+
+Types ≥ 4 take the `else` branch: int16 × 1/32767 → float, then the switch at **0x43FCE8** (78 bytes) calls
+`engine(state, buf)` for each voice. All four float engines share one state object per voice (0x78 bytes @
+0x20414E84, stride 0x78; the voice index is stored inside it at word 0x1D). Any new type ≥ 9 already reaches
+this switch, so adding engines on Argon means replacing that switch and raising the three clamps.
+
+**Cobalt dispatch** (block function 0x43F410). All float. Voices render via 0x439775, then:
+
+| type | names | engine | state/voice |
+|---|---|---|---|
+| 0–3 | Reso LP, Balanced LP, Balanced HP, Balanced Phase | 0x43A648 (7.6 KB, one loop per type, nonlinear: `vsqrt`) | 0x24 @ 0x2040B738 |
+| 4–5 | SVF LP/BP/HP, SVF LP/Notch/HP | 0x43D578 (3 KB) | 0x6C @ 0x2040BC24 |
+| 6–30 | the 25 "L …" modes | 0x43C7FC (3 KB) | 0x68 @ 0x2040B598 |
+
+Engines are called as `engine(buf, state, voice)`. The "L" engine is a 4-pole zero-delay-feedback ladder with
+saturation, run 2× per sample, with a 16-tap symmetric FIR decimator. Its output is a mix of the input and the 4
+pole outputs, `Σ mix[type-6][k]·tap[k]`, from a 25 × 5 float table @ **0x44A0EC**: Xpander/Matrix-12-style pole
+mixing (24LP = 0 0 0 0 1, 24HP = 1 −4 6 −4 1, …).
+
+**Carbon 1.1 dispatch** (slave block function around 0x425F80, 48 kHz, all float). It has the same Type slot
+(+0x33), and slot +0x17 is "Warp" (Cobalt's Morph). Clamps: panel max 33 (record 0x449434), master `cmp r6,#0x21`
+@ 0x430D9C, slave 0x42A500. It dispatches **per block**: `type ≤ 7 ? 0x424CFD : 0x423409`. Each of those
+214-byte wrappers smooths Reso (+0x19) and Warp (+0x17) into two shared 128-float ramps, then calls
+`engine(buf, state, voice, reso_ramp, warp_ramp)` for each of the 4 voices:
+
+| type | names | engine | state/voice |
+|---|---|---|---|
+| 0–1 | SVF LP/BP/HP, SVF LP/Notch/HP | 0x423558 (3 KB) | 0x78 @ 0x2042C594 |
+| 2–7 | Dual LP/BP/HP, Dual LP Alt, Dual HP Alt, Dual Peaking | 0x424244 (2.4 KB) | same as SVF |
+| 8–32 | the 25 "L …" modes | 0x421C70 (2.7 KB), mix table 0x4309AC (= Cobalt's) | 0x68 @ 0x20412994 |
+| 33 | Adj Phaser | 0x422858 (2.7 KB) | same as L |
+
+- **Carbon voice buffers run at 2× rate**: 0x400 bytes per voice, 256 samples per 128 output samples. The L and
+  Adj Phaser engines feed both input samples of each pair into their 2× ladder and decimate with the 16-tap FIR.
+  Cobalt's L engine instead gets 1× input and interpolates it up. Dual and SVF read only every other input
+  sample (`ptr += 2`).
+- **Dual**: two parallel 2-pole zero-delay-feedback SVFs, each with saturated resonance feedback. Warp spreads
+  the two cutoffs in opposite directions, up to ±2 octaves (tables 0x441A98: 1→0.25 and 0x441298: 1→4,
+  ~512 entries). Output = 1.2 × Σ of an 8-float row from the mode table at RAM 0x2040317C (.data, flash 0x46ACE4
+  + offset): columns 1–3 are filter A's LP/BP/HP and 5–7 are filter B's. Example rows: Dual LP = LP_A + LP_B,
+  Dual LP Alt = −0.9 LP_A + 1.2 LP_B, Dual HP Alt = LP_A − LP_B + 0.1 HP_B. Input gain is 0.6, clipped to ±4.
+- **Adj Phaser**: the L ladder core with no table row. Warp computes the pole mix continuously:
+  `x − 4·y1 + 12k(w²+2)·y2 − 8(w²+1)·y3 + 4(w²+1)·y4`.
+- **SVF / L** are the same algorithms as Cobalt's but compiled separately, with retuned SVF constants and the
+  2× input. On the "L" modes, Warp/Morph drives the input on both firmwares (`(1 + w·k)·x`).
+- Mod-matrix values are float as on Cobalt, but the destination slots differ: Carbon engines index the
+  routing table at +0x26/+0x28/+0x2A (cutoff, reso, warp), Cobalt at +0x20/+0x22/+0x24. The patch tail matches
+  Cobalt (Cutoff Scaling +0x63).
+
+**Porting assessment.**
+- Every engine on both sides is a **leaf function**: no calls, about 25 RAM globals, 2–4 flash tables. So
+  transplanting it as a binary is realistic: copy the code into free slave flash, rewrite its literal pool and
+  give it its own state RAM. The 4 Argon float engines use the same 27 globals, and the 3 Cobalt engines the
+  same ~25. One mapping table per direction therefore covers a whole family.
+- The globals are the same things on both sides (both firmwares compile the same cutoff/keytrack/mod code;
+  the polynomial and its constants are identical). What differs is their type: **Argon's per-sample mod-matrix
+  buffers are int16** (0x20405B50/0x20407B50/0x20409B50, read with `ldrsh` and Q15 saturation), while
+  **Cobalt's are float** (0x2040299C/0x2040699C/0x2040A99C). Relocating addresses isn't enough. Either patch
+  those loads, or run a per-block shim that converts the few destinations a filter reads (cutoff/reso/morph ×
+  4 voices × 128) into a scratch buffer in the other layout.
+- Rate-dependent data: point the cutoff table at the host's own one (same shape, already right for its rate),
+  and rescale the handful of 1/fs constants (e.g. 0.0002911 ↔ 0.0002675, the smoothing poles). The mix table,
+  the FIR decimator and the vintage table don't depend on the rate.
+- Patch offsets: +0x65 → +0x63 (Cutoff Scaling). The Argon engines' +0x02 Distortion drive has no Cobalt
+  equivalent (use a constant or another parameter).
+- **Easiest: Cobalt "L" modes → Argon.** One 3 KB engine and 25 new types. The Argon float path already feeds
+  float blocks, so only the 0x43FCE8 switch, the clamps and the panel names change. **Also realistic: Argon
+  Ladder / Hybrid / Phaser / Sallen-Key → Cobalt** (4 × ~3.5 KB plus a ≥31 branch in 0x43F410). **Hard:
+  Argon Standard/Classic → Cobalt.** They are Q15 code wrapped around Argon's int16 voice path and int16
+  coefficient tables, so a C reimplementation is more practical than a transplant. Cobalt's Reso LP/Balanced
+  engine (7.6 KB, 228 literals) is portable in principle but is the largest float engine.
+- **Carbon Dual (6 modes) and Adj Phaser → Cobalt: closest pair.** They share the sample rate, float mod values
+  and patch tail. Glue: (a) a copy of Carbon's 214-byte wrapper (reso/warp ramps); (b) 2× input. Dual only takes
+  even samples, so its stride can be patched to 1, or a shim can duplicate samples. Adj Phaser needs real
+  2× input, so the shim should interpolate as Cobalt's L engine does. (c) Mod-routing offsets 0x26/0x28/0x2A →
+  0x20/0x22/0x24. (d) The Dual mode table lives in RAM `.data`, so copy it into flash and repoint.
+  Cobalt Reso LP/Balanced → Carbon is the reverse case: those engines expect 1× input, so a shim must decimate
+  Carbon's 2× buffer first. Carbon → Argon has all the Cobalt → Argon issues plus the 2× input.
+- Unknowns: CPU headroom on each slave (Cobalt's engines run 2× per sample), which state fields the type-change
+  hooks (Argon flag at 0x20405920, Cobalt 0x43A5E9) reset, and where the second set of 4 voices runs.
+
 ## Feature differences (first pass: panel UI strings unique to each model)
 
 - **Argon8 only:** wavetable/"Osc Spread"/"Voice Drift" engine names, the Argon filter set (Ladder,
@@ -196,7 +312,8 @@ needs code in the DSP images, the panel parameter/name tables, and the panel↔D
 
 - Map the panel↔master link (UART/I2C framing, `F0 00 21 07 <dev> …` command set) and the parameter ID space.
 - Find the parameter tables (name, range, display format) in the panel and the matching dispatch in the master.
-- Find the oscillator/filter/FX algorithm dispatch tables in master/slave (needed for porting an engine).
+- Find the oscillator/FX algorithm dispatch tables in master/slave (needed for porting an engine). Filters are
+  mapped (see "Filters").
 - Free flash for injected code: images end at 0x456E00 (Argon panel), 0x486F80 (Argon master) and
   0x499B00 (Argon slave). Total flash size per MCU is not confirmed.
 - Panel-side handling of the incoming `…7F` start message (entry into update mode) is not traced yet.
