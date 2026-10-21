@@ -197,14 +197,28 @@ field: `min` is the bit position. The ID → offset mapping comes from each mast
 | +64 | Vintage (0xC4) | **unused** | LFO3 Transform (0x0C) |
 | +65 | Cutoff Scaling (0xC5) | **unused** | XCore (0xC6, 0–5) |
 | **+66** | **unused** | **unused** | **unused** |
-| +67 | ID 0xB7 (no panel record) | = | = |
+| **+67** | **free**: ID 0xB7 is written by the master setter only, never read | = | = |
 | +68–+7F | mod matrix: 8 slots × 3 bytes (Source/Dest/Depth, IDs 0x58–0x73) | = | = |
 
 - **+0x66 is free in all three.** No master or slave code reads or writes it through the edit-buffer base.
   It is still saved, so stock patches hold 0 there.
-- **+0x67** is written by the master setter for ID 0xB7. The slave setter ignores 0xB7 (default case), and
-  no master code reads +0x67. No panel record exists. It may be dead, or used only by SysEx/the editor app.
-  Unverified.
+- **+0x67 is usable** (checked on Carbon 1.1; Argon and Cobalt have the same setter case):
+  - Master: the only writer is the setter case for ID 0xB7 (Carbon 0x432022: `strb r6,[r3,#0x67]`, then
+    return). The getter returns 0 for 0xB7, and no code reads +0x67. The other `[#0x67]` hits are whole-record
+    byte copies (0x41CD5E, 0x41CDE6…) or other structs.
+  - Slave: the setter ignores 0xB7 (default case). Nothing accesses +0x67.
+  - Panel: 0xB7 has no parameter record. It is a **sequencer button function**: handler 0x42CAF6. With the
+    sequencer stopped it shows "Function not available when sequencer isn't running". Otherwise it cycles a
+    0–2 state (0x2000A10E) shown as Off / "Start point set" / On (strings via 0x41CC44) and sends a
+    user-assigned MIDI CC (0x42542C). The panel's own patch copy (0x2000D528, same offsets) gets +0x67 from
+    incoming patch dumps (0x43083C, 0x430F16), but nothing reads it there.
+  - Data: **all 300 Carbon factory patches have +0x66 = +0x67 = 0** ("Carbon Factory Set V1, May 24").
+  - Residual: the master stores whatever arrives as ID 0xB7 (e.g. through a CC mapping, which was not traced).
+    So old user patches might hold junk there. That's harmless: only non-Carbon engines (types 56–127) would
+    read it, and no stock patch selects those. The new firmware repoints the setter case anyway.
+- **SysEx patch dump** (from the factory set): `F0 00 21 07 1D 02 <bank> <slot> <128 raw bytes> F7`, 137 bytes,
+  bank = n / 100, slot = n % 100, no name. The record goes out unchanged, so +0x66/+0x67 travel with dumps
+  without a format change.
 - Audio In → FX (0x95), XY Lock (0x9A) and Audio In Volume (0x53) are global RAM variables, not patch
   bytes, even though the same setter handles them.
 - Modal already bit-packs in Cobalt/Carbon (+0x27, +0x28), and the panel record format supports bit fields.
@@ -230,8 +244,8 @@ field: `min` is the bit position. The ID → offset mapping comes from each mast
 - **Decided (2026-10-21):** (b), a flat type list in +0x31/+0x32. The engines share some duplicate types,
   which won't be ported, so 128 entries are enough. Cobalt's Mix (+0x08) is dropped: Carbon keeps XMod there
   and its per-osc Levels at +0x09/+0x0A (see "Oscillator combine stage"). Parameter 2 (Cobalt Param B, Argon
-  WavMod) goes in +0x66 (Osc1) and +0x67 (Osc2). That still depends on confirming ID 0xB7 is dead. If it
-  isn't, Osc2's parameter 2 needs 7 spare high bits from elsewhere.
+  WavMod) goes in +0x66 (Osc1) and +0x67 (Osc2). +0x67 was checked: it's usable (see above). The master
+  setter case for 0xB7 should be removed or repointed so the sequencer function can't write it.
 
 ## Oscillator combine stage and XMod (Carbon 1.1 slave)
 
@@ -508,9 +522,9 @@ needs code in the DSP images, the panel parameter/name tables, and the panel↔D
 - Map the panel↔master link (UART/I2C framing, `F0 00 21 07 <dev> …` command set). The parameter ID space
   and the master's ID → patch-byte dispatch are mapped (see "Patch storage"). The `f6`/`f7` fields of the
   panel records (display format?) are not decoded.
-- Patch storage follow-ups: what ID 0xB7 / +0x67 is for (now blocking: Osc2 parameter 2 is planned there), and whether anything outside the master's setter
-  touches it; the SysEx patch dump/receive format (is it the raw 128 bytes?); the panel's patch copy and its
-  readers; the 4 × 0x8E-byte master records at 0x204439BC that the get/set switches iterate over; and the
+- Patch storage follow-ups: how the master routes the panel's 0xB7 sequencer function (it doesn't use
+  +0x67: see "Patch storage"); where the panel's patch copy is bulk-filled; the master's MIDI CC/NRPN → ID map;
+  the 4 × 0x8E-byte master records at 0x204439BC that the get/set switches iterate over; and the
   sequencer layout in master flash 0x49C000–0x4BA000.
 - Slave CPU headroom per block on each model (the main risk of the Carbon base), including the cost of a Cobalt alg at 96 kHz vs 48 kHz plus upsampling.
 - Find the oscillator/FX algorithm dispatch tables in master/slave (needed for porting an engine). Filters are
