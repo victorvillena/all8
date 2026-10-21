@@ -5,7 +5,7 @@ porting features between them. Reverse-engineering notes (formats, addresses, op
 kept in [`NOTES.md`](NOTES.md).
 
 Running one model's firmware on another model's hardware, and flashing in general, is handled by
-the separate [crossflash-8](../../crossflash-8) project. This repo produces `.syx` sets that you
+the separate [crossflash-8](https://github.com/victorvillena/) project. This repo produces `.syx` sets that you
 flash with its flasher.
 
 > **Status:** custom wavetable builds have been flashed to an Argon8: bank names and bank switching
