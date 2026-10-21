@@ -17,7 +17,8 @@ How it works (details in NOTES.md, "Cobalt oscillators on Carbon"):
   master  Core clamps raised to 95; ID 0xB4 stores +0x66 (0xB7 already stores +0x67); both are
           readable through the parameter getter; patch loads apply +0x66 like any other byte.
   panel   Core range 0-95 with Cobalt's names; "Param B" entries in the Osc1/Osc2 menus; IDs
-          0xB4/0xB7 handled like an ordinary 0-127 parameter everywhere the panel switches on IDs.
+          0xB4/0xB7 handled like an ordinary 0-127 parameter everywhere the panel switches on IDs;
+          Patch+Level1 / Patch+Level2 turn Param B of Osc1 / Osc2.
 
 Usage:
   carbon_cobalt.py build <Carbon8 1.1 syx dir> <Cobalt8 2.1 syx dir> <out dir>
@@ -530,6 +531,14 @@ class CarbonPanel:
                    0x422582, 0x42272A, 0x4233B0, 0x426D3E, 0x4277EE, 0x427E82, 0x42AE7A, 0x42B19C,
                    0x42D63A, 0x42D854, 0x42DB0A, 0x42DE2E)
     TEMPLATE_ID, TEMPLATE_OFFSET = 0x12, 0x08
+    # knob handler 0x435DE0: one case per knob loads r9 = value, r0 = max, r10 = ID, then goes to KNOB_SET
+    UI = 0x2000CDB4                        # UI state: +0 -> shift button's held flag, +0xD Patch held
+    UI_PATCH_HELD = 0x0D
+    PATCH_USED = 0x200074D2                # set by Patch+knob cases; Patch's release then does nothing else
+    LEVEL_KNOBS = (0x436004, 0x436190)     # Level1/Level2 cases: ldr r3,=UI ; ldr r3,[r3] ; ldrb r3,[r3] ;
+                                           # cmp r3,#0 ; beq.w Level (else the shift layer: Glide / Drift)
+    LEVEL_IDS = (0x13, 0x14)
+    KNOB_SET = 0x435EA4
 
 
 def id_switch(img, cmp_addr):
@@ -758,6 +767,33 @@ def patch_panel(panel, cobalt_panel):
             for pid in ID_PARAM_B:
                 struct.pack_into("<I", img, table + 4 * (pid - 3) - BASE, s.labels[f"id{pid:x}"] | 1)
         syms[f"switch_{sw:x}"] = stub_at
+
+    # 5. Patch+Level1 / Patch+Level2 turn Param B, like the stock Patch+XMod (Free Run) case
+    for a, level_id, pid, off in zip(P.LEVEL_KNOBS, P.LEVEL_IDS, ID_PARAM_B, OFF_PARAM_B):
+        h, = struct.unpack_from("<H", img, a - BASE)
+        check(h >> 8 == 0x4B and u32(img, ((a + 4) & ~3) + (h & 0xFF) * 4) == P.UI, f"Level knob at {a:#x}")
+        expect(img, a + 2, "1b681b78002b", f"Level knob at {a:#x}")
+        level = thumb.decode_branch(*struct.unpack_from("<HH", img, a + 8 - BASE), a + 8)
+        expect(img, level + 8, bytes([0x4F, 0xF0, level_id, 0x0A]).hex(), f"Level knob at {a:#x}: ID")  # mov.w r10,#id
+        s = Asm((at + 15) & ~15)
+        s.mov32("r3", P.UI)
+        s.ldrb("r2", "r3", P.UI_PATCH_HELD)
+        s.cmp("r2", 0)
+        s.bcond("ne", "patch")
+        s.ldr("r3", "r3")
+        s.b(a + 4)
+        s.label("patch")
+        s.mov32("r3", P.PATCH)
+        s.ldrb("r9", "r3", off)
+        s.mov32("r3", P.PATCH_USED)
+        s.movs("r0", 1)
+        s.strb("r0", "r3")
+        s.movs("r0", 127)
+        s.movw("r10", pid)
+        s.b(P.KNOB_SET)
+        stub_at = emit(s.assemble(), 16)
+        put(img, a, thumb.enc_b_w(a, stub_at))
+        syms[f"level_knob_{pid:x}"] = stub_at
 
     syms["end"] = at
     img.extend(b"\xff" * ((-len(img)) % PAGE))

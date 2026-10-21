@@ -436,9 +436,23 @@ everything else to setter(id = cc, val). Whole patches go through the slave's ow
 - 20 ID switches (`cmp rN,#0xC3`; list in `CarbonPanel.ID_SWITCHES`) get 0xB4/0xB7 cases cloned from ID 0x12
   (XMod, +0x08) with the offset changed: `tbh` switches through a pre-dispatch stub, the two `ldr pc` tables
   (0x41FDE4, 0x42DB0A) by table entry.
+- Front-panel knobs: handler 0x435DE0(_, delta) gets the knob index from 0x435AC0 and switches over 27 cases
+  (`tbh` at 0x435DFE). Each case loads r9 = current value, r0 = max, r10 = ID and branches to 0x435EA4, which
+  clamps, calls setter 0x426D2C, sends (0x42542C, 0x425EE4) and shows the parameter (0x42012C). Two modifier
+  layers: UI state 0x2000CDB4 +0 points at the **shift** button's held flag (button 16, 0x200050E0 + 16·12 + 5;
+  shift+Level1 = Glide, shift+Level2 = Drift, shift+Contour = Core, shift+Tune1 = Fine) and +0xD is **Patch**
+  held (button 0x12; Patch+XMod = Free Run, Patch+Cutoff = Type). Patch cases are tested first, and they set
+  0x200074D2 so that releasing Patch (release handler 0x433674, case 0x12) skips its own action. Buttons
+  are 12-byte objects at 0x200050E0 (+0 press time, +4 handled, +5 held); press handler 0x432B78, matrix scan
+  0x435108.
+- Patch+Level1/2 → Param B: the Level1 (knob 14, 0x436004) and Level2 (knob 16, 0x436190) cases begin
+  `ldr r3,=UI ; ldr r3,[r3]`, and the tool replaces those two with a `b.w` to a stub. If UI+0xD is set,
+  the stub loads +0x66/+0x67, sets 0x200074D2, max 127, ID 0xB4/0xB7 → 0x435EA4. Otherwise it redoes the two
+  loads and returns. The mod-destination table 0x444364 has 127 (none) for 0xB4/0xB7, as for Free Run.
 - Checked: boot copy, menus, names, title hook, and encoder edits of records 265/266 through the encoder
   handler 0x42CDD0 (updates +0x66/+0x67 and sends 0xB4/0xB7 through 0x42542C and 0x425EE4 exactly as a Core
-  edit does).
+  edit does). Knob handler in unicorn: Patch+Level1/2 update +0x66/+0x67 (clamped 0–127), send 0xB4/0xB7 and
+  set 0x200074D2; without Patch, Level1/2, Glide and Drift behave exactly as stock.
 
 ## Argon8 wavetables (slave 3.2)
 

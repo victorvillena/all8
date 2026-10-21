@@ -127,6 +127,8 @@ python3 tools/carbon_cobalt.py cores      # Core number of each Cobalt algorithm
   screen shows the algorithm's own name for it (Shape, Sync, Width, …).
 - A new **Param B** entry follows Contour in the Osc1 and Osc2 menus (patch bytes +0x66/+0x67, saved with
   the patch). On a Cobalt Core it is titled with the algorithm's name for it (Spread, Sub, Asym, …).
+  Shortcut: hold **Patch** and turn **Level1** / **Level2** to change Osc1 / Osc2 Param B, the same way
+  Patch+XMod sets Free Run.
 - Level, XMod, XCore, Drift, the mod matrix and the filters work on Cobalt Cores as on Carbon's. Contour
   modulation reaches Param A; Param B has no mod destination.
 - The oscillator waveform display uses Cobalt's own preview renderer. It redraws when Core or Contour
