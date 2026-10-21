@@ -630,6 +630,34 @@ mixing (24LP = 0 0 0 0 1, 24HP = 1 −4 6 −4 1, …).
 - Unknowns: CPU headroom on each slave (Cobalt's engines run 2× per sample), which state fields the type-change
   hooks (Argon flag at 0x20405920, Cobalt 0x43A5E9) reset, and where the second set of 4 voices runs.
 
+## Boot screen (all three panels, `tools/boot_screen.py`)
+
+One routine draws it: Argon 0x41C10C, Cobalt 0x41B928, Carbon 0x41ABB0. It is the same code in all three, apart from
+addresses and the frame size. It is called repeatedly while booting. The display is a 128×64 **u8g2** instance at
+0x2000CE20 (Carbon). Fonts are standard u8g2 fonts (23-byte header, RLE glyphs), and the helpers are the u8g2 ones
+(Carbon: SetFont 0x411F10, GetStrWidth 0x411F38, DrawStr 0x411E84, DrawLine 0x412114, sprintf 0x43AE30).
+
+- If the error flag (Carbon 0x2000A16C) is set, it draws the error screens instead ("Incorrect Firmware",
+  "BOOT ERROR!" / "Please reboot...").
+- Otherwise:
+  - The name ("CARBON") is copied onto the stack at sp+0x24 with an inlined `ldm` + 7-byte store (6 bytes on Argon).
+  - The suffix goes to sp+0x1c: "8M" if user-signature byte 4 is 2, "8X" if it is 4, else "8".
+  - Name (large font) and suffix (second font) share a baseline at y = h_suffix/2 − h_small + 34 (31 on all three).
+    They are centred together: x = 63 − (w_suffix/2 + w_name/2), with the suffix 2 px after the name.
+  - The version line is `sprintf(buf, "v%d.%0d", maj, min)`, centred (64 − w/2) one small-font height lower.
+    The version numbers are immediates (3.2 / 2.1 / 1.1). The buffer is 28 bytes, 24 on Cobalt.
+  - A dash (x = c..c+10, y = 60) advances 1 px per call (counter at Carbon 0x2000759C, wraps at 128).
+- **Patch points** (Carbon; Argon and Cobalt are listed in the tool):
+  - Name: `add r1/r3, sp, #0x24` at 0x41AC06 / 0x41AC5A become `ldr r1/r3, [pc]` of the name literal 0x41AE34,
+    which is repointed. The `ldm` copy still runs, so the new string must be word aligned with 8 bytes readable.
+  - Suffix: `add r1/r3, sp, #0x1c` at 0x41AC14 / 0x41AC6E load the "8M" literal 0x41AE80 instead.
+    The 8M branch's 3-byte copy from it is then dead.
+  - Version format: literal 0x41AE54.
+- **Settings > Version** is the parameter display routine's `sprintf(out, "CARBON8 %d.%0d", 1, 1)`, literal 0x41CCF8
+  (Argon 0x41EE64, Cobalt 0x41E01C). On Argon its callers pass 20–30-byte buffers. The tool keeps the result to 13
+  characters, the longest value the routine already writes.
+- "Modal Electronics" / "CARBON8" (0x448C84) have no literal references in the panel.
+
 ## Feature differences (first pass: panel UI strings unique to each model)
 
 - **Argon8 only:** wavetable/"Osc Spread"/"Voice Drift" engine names, the Argon filter set (Ladder,

@@ -140,6 +140,33 @@ the standard library. The DSP glue is C (`tools/glue/cobalt_glue.c`), stored com
 `tools/glue/cobalt_glue.json`. After editing the C, regenerate it with `python3 tools/glue/make_glue.py`
 (needs a clang with the ARM backend, such as Apple's command-line tools).
 
+### `tools/boot_screen.py`: boot screen name
+
+> **Status:** checked offline only (disassembly and a render of the panel's own fonts), not yet on hardware.
+
+Changes what the panel shows while it boots: the big model name (`CARBON`), the `8`/`8M`/`8X` after it,
+and the `v1.1` line under it. It works on a stock set or on a set built by the other tools, for all three
+models, and writes a copy of the set with only the panel changed.
+
+```bash
+# What a set shows now (drawn in the terminal; --png writes a 4x preview image)
+python3 tools/boot_screen.py show out/
+
+# "NOVA" instead of "CARBON8"
+python3 tools/boot_screen.py build out/ renamed/ --name NOVA --suffix ""
+
+# "CARBON8" with "Custom v1.1" underneath
+python3 tools/boot_screen.py build out/ renamed/ --subtitle Custom
+```
+
+- `--name` replaces the model name, and also the Settings "Version" entry (`NOVA 1.1`) when that
+  fits in 13 characters.
+- `--suffix` replaces the suffix for every variant. Without it, the unit's own `8`/`8M`/`8X` stays, and
+  `--suffix ""` removes it.
+- `--subtitle` goes before the version on the small line. The version itself can't be removed.
+- Text is printable ASCII. The tool measures it with the firmware's fonts and refuses anything wider than
+  the 128-pixel screen. It can be run again on its own output.
+
 ## Flashing a built set
 
 Flash with crossflash-8's flasher. It sends whatever set is in the directory, provided the set's model
