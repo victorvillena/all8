@@ -207,13 +207,25 @@ field: `min` is the bit position. The ID → offset mapping comes from each mast
     return). The getter returns 0 for 0xB7, and no code reads +0x67. The other `[#0x67]` hits are whole-record
     byte copies (0x41CD5E, 0x41CDE6…) or other structs.
   - Slave: the setter ignores 0xB7 (default case). Nothing accesses +0x67.
-  - Panel: 0xB7 has no parameter record. It is a **sequencer button function**: handler 0x42CAF6. With the
-    sequencer stopped it shows "Function not available when sequencer isn't running". Otherwise it cycles a
-    0–2 state (0x2000A10E) shown as Off / "Start point set" / On (strings via 0x41CC44) and sends a
-    user-assigned MIDI CC (0x42542C). The panel's own patch copy (0x2000D528, same offsets) gets +0x67 from
-    incoming patch dumps (0x43083C, 0x430F16), but nothing reads it there.
+  - Panel: none of the 265 parameter records (flash 0x449234, copied to RAM 0x20000678 as `.data` from
+    0x448BBC) has ID 0xB7, so the panel never sends it. The panel's own patch copy (0x2000D528, same offsets)
+    gets +0x67 from incoming patch dumps (0x43083C, 0x430F16), but nothing reads it there.
+  - **Seq Loop doesn't touch +0x67.** Earlier this note called 0xB7 a panel sequencer function; that was the
+    *record index* (#0xB7 = "Loop"), not the parameter ID. Handler 0x42CAF6: with the sequencer stopped it
+    shows "Function not available when sequencer isn't running"; otherwise it cycles a 0–2 state
+    (0x2000A10E: Off / "Start point set" / On, strings via 0x41CC44) and calls 0x42542C(ch, record#0xB7.id =
+    **0x47**, value, 7). That sends `B0 47 vv` to the master over the internal link (port 0xB) and CC 71 to
+    MIDI out. The master's setter case 0x47 (0x431C1A) calls 0x432DA8, which only changes sequencer state in
+    RAM (0x20420573/76/7D/8A, 0x20400AEC–0x20400B80) and sends ID 0x48 (Record) back. The edit buffer isn't
+    touched, so using Seq Loop can't change B2.
+  - Master patch load (0x4409C2) applies the record through the setter using the offset → ID table at
+    0x452EE8 (+0x66 → 0x00 = skipped, +0x67 → 0xB7), so +0x67 gets the loaded patch's own value. The
+    mutate loop (0x43E724, per-offset mode table 0x452F68) has mode 0 for +0x66/+0x67, so it leaves them
+    alone. In the new firmware, give +0x66 a real ID in 0x452EE8 so B1 is applied on load like B2, and set
+    the mode-table entries if B1/B2 should take part in mutation.
   - Data: **all 300 Carbon factory patches have +0x66 = +0x67 = 0** ("Carbon Factory Set V1, May 24").
-  - Residual: the master stores whatever arrives as ID 0xB7 (e.g. through a CC mapping, which was not traced).
+  - Residual: the master stores whatever arrives as ID 0xB7 (e.g. an external NRPN, if the master's MIDI-in
+    map reaches it; not traced).
     So old user patches might hold junk there. That's harmless: only non-Carbon engines (types 56–127) would
     read it, and no stock patch selects those. The new firmware repoints the setter case anyway.
 - **SysEx patch dump** (from the factory set): `F0 00 21 07 1D 02 <bank> <slot> <128 raw bytes> F7`, 137 bytes,
@@ -243,8 +255,9 @@ field: `min` is the bit position. The ID → offset mapping comes from each mast
   XMod/XCore and aren't counted above.
 - **Decided (2026-10-21):** (b), a flat type list in +0x31/+0x32. The engines share some duplicate types,
   which won't be ported, so 128 entries are enough. Cobalt's Mix (+0x08) is dropped: Carbon keeps XMod there
-  and its per-osc Levels at +0x09/+0x0A (see "Oscillator combine stage"). Parameter 2 (Cobalt Param B, Argon
-  WavMod) goes in +0x66 (Osc1) and +0x67 (Osc2). +0x67 was checked: it's usable (see above). The master
+  and its per-osc Levels at +0x09/+0x0A (see "Oscillator combine stage"). Parameter 2 (Cobalt Param B1/B2, Argon
+  WavMod) goes in +0x66 (Osc1: B1) and +0x67 (Osc2: B2), one full 7-bit byte each, so B1 and B2 keep their
+  independent 0–127 ranges as in Cobalt (+0x09/+0x0A there). +0x67 was checked: it's usable (see above). The master
   setter case for 0xB7 should be removed or repointed so the sequencer function can't write it.
 
 ## Oscillator combine stage and XMod (Carbon 1.1 slave)
@@ -522,8 +535,7 @@ needs code in the DSP images, the panel parameter/name tables, and the panel↔D
 - Map the panel↔master link (UART/I2C framing, `F0 00 21 07 <dev> …` command set). The parameter ID space
   and the master's ID → patch-byte dispatch are mapped (see "Patch storage"). The `f6`/`f7` fields of the
   panel records (display format?) are not decoded.
-- Patch storage follow-ups: how the master routes the panel's 0xB7 sequencer function (it doesn't use
-  +0x67: see "Patch storage"); where the panel's patch copy is bulk-filled; the master's MIDI CC/NRPN → ID map;
+- Patch storage follow-ups: where the panel's patch copy is bulk-filled; the master's MIDI CC/NRPN → ID map;
   the 4 × 0x8E-byte master records at 0x204439BC that the get/set switches iterate over; and the
   sequencer layout in master flash 0x49C000–0x4BA000.
 - Slave CPU headroom per block on each model (the main risk of the Carbon base), including the cost of a Cobalt alg at 96 kHz vs 48 kHz plus upsampling.
