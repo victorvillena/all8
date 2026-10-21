@@ -227,6 +227,74 @@ field: `min` is the bit position. The ID → offset mapping comes from each mast
   the SysEx format is extended too.
 - Argon's other oscillator controls (Osc Mode 0–112, OscMod, Spread, Mix, Osc2 Tune Mode) overlap Carbon's
   XMod/XCore and aren't counted above.
+- **Decided (2026-10-21):** (b), a flat type list in +0x31/+0x32. The engines share some duplicate types,
+  which won't be ported, so 128 entries are enough. Cobalt's Mix (+0x08) is dropped: Carbon keeps XMod there
+  and its per-osc Levels at +0x09/+0x0A (see "Oscillator combine stage"). Parameter 2 (Cobalt Param B, Argon
+  WavMod) goes in +0x66 (Osc1) and +0x67 (Osc2). That still depends on confirming ID 0xB7 is dead. If it
+  isn't, Osc2's parameter 2 needs 7 spare high bits from elsewhere.
+
+## Oscillator combine stage and XMod (Carbon 1.1 slave)
+
+Source: the Ghidra slave decompiles from the filters work, with literal pools resolved. All addresses are Carbon
+1.1 slave unless marked otherwise.
+
+**Block function 0x41EF38.** The outer loop runs over the oscillators and the inner loop over the 4 voices.
+1. Control smoothing (one-pole, 0.006 per sample, 128 values per block): Osc1 Contour +0x06, Osc1 Level
+   +0x09, Osc2 Level +0x0A, and XMod +0x08 (patch copy 0x20413134). When osc2's pass starts, Contour +0x07
+   is smoothed into the same contour array 0x2042E7E4.
+2. Osc1 pass: for each voice, `render(state, out, osc, contour[])` writes osc1 into the voice's output buffer.
+3. Osc2 pass, for each voice:
+   - add the mod-matrix contributions to XMod and both Levels (mod buffers 0x20408964/0x2040C964, routing
+     slots in 0x204020B8);
+   - render osc2 into 0x2042CDA4;
+   - map Level1 and Level2 through a 256-entry gain curve (0x452298) to get g1 and g2;
+   - combine according to **XCore (+0x65)**, written back into the voice buffer.
+4. Note-on bookkeeping. The voice buffer then goes to the filter.
+
+Oscillator buffers hold **256 samples per 128-sample block (96 kHz, 2× oversampled)**, and the control arrays
+hold 128 values (read with index `i >> 1`). Note-on also uses 96000.
+
+**Render dispatch** (0x41A130): `render(state, out[256], contour[128], osc)`. The state is
+`0x2042DBA4 + voice·0x148 + osc·0x520`. The selected Core at 0x20406714[osc] indexes two flash tables: a render
+family (0x4526AC) and a kind (0x4521B8, where kind 2 selects a second switch). Together they select one of 22
+render functions. A ported engine family is one more case here.
+
+**XCore modes** (o1/o2 = osc outputs, x = XMod 0–1, g1/g2 = level gains; the output is `o1·g1 + f(o2)·g2`):
+
+| XCore | f(o2) | effect |
+|---|---|---|
+| 0 | `o2 + x·(o1·o2 − o2)` | crossfade osc2 → ring mod o1·o2 |
+| 1 | `min(o2, o1 + 2(1−x)²)` | osc2 clipped from above by osc1 |
+| 2 | one-pole smoother on o2; coefficient = table 0x2040217C[(o1+1)/2 · x · 1022] (RAM, from .data) | osc1 drives a lowpass on osc2 |
+| 3 | `o2 + u·x·(o2² − o2)`, u = (o1+1)/2 clamped to 0–1 | osc1-gated squaring of osc2 |
+| 4 | `o2 + x·(s·o2 − o2)`, s = sine at **half** the per-voice increment 0x2040003C | sub-octave sine ring mod on osc2 |
+| 5 | before osc2 renders: `contour2[i] += s·x`, clamped to 0–1, s = sine at the full increment; then a plain sum | sine modulation of osc2's Contour |
+
+The sine table is 0x45C490 (1024 floats), and the phase is per voice (0x20406704). Values ≥ 6 would give a
+plain sum, but the slave clamps XCore to 5. Which pitch 0x2040003C carries (osc1 or the voice note) is not
+verified.
+
+**Consequence for ported oscillators.** XCore modes 0–4 work only on the two rendered buffers, so **they work
+with any engine** that renders into Carbon's format (float, 256 samples at 96 kHz). A port has to produce that
+format anyway to pass through the Levels. Mode 5 is the only engine-specific mode: it feeds the per-sample
+parameter-1 array (Contour → Param A / Wave), so the ported engine must read parameter 1 from that array
+rather than from the patch byte.
+
+**Cobalt 2.1 for comparison.** The voice function is 0x439774. It calls `alg(out[128], voice_state, osc)` through the 40-case
+switch at 0x439490 for each oscillator, then crossfades `o1 + mix·(o2 − o1)` with Mix +0x08 (≥ 0x7E → 1.0)
+plus mod. There's no cross-mod stage, so Carbon's Level + XCore stage replaces this whole crossfade. Porting
+a Cobalt algorithm into Carbon's render switch needs:
+- **Rate.** Cobalt algs loop exactly 128 samples at 48 kHz. The caller computes phase increments as `f/48000`
+  into the voice state (8 × 0x44 B entries alternating osc1/osc2, i.e. 4 per osc; more fields follow up to
+  +0x280). Options: call twice per
+  block with `f/96000` (2× CPU, and the per-sample smoothing constants 0.999/0.001 must be adjusted), or
+  render at 48 kHz and upsample 2×.
+- **Parameters.** Algs read Param A themselves from patch +0x06/+0x07, smooth it per sample and add the float
+  mod buffers (0x2040299C/0x2040699C, routing 0x204000C4). Carbon's buffers have the same shape at different
+  addresses (0x20408964/0x2040C964, 0x204020B8). Param B reads (+0x09/+0x0A) must move to +0x66/+0x67.
+  Wrapping the alg to take Carbon's contour array also makes XCore 5 work.
+- **State.** Cobalt's per-voice state is larger than Carbon's 0x148 slot, so it needs its own RAM. That's
+  fine, since the slave has 181 KB free.
 
 ## Argon8 wavetables (slave 3.2)
 
@@ -440,11 +508,11 @@ needs code in the DSP images, the panel parameter/name tables, and the panel↔D
 - Map the panel↔master link (UART/I2C framing, `F0 00 21 07 <dev> …` command set). The parameter ID space
   and the master's ID → patch-byte dispatch are mapped (see "Patch storage"). The `f6`/`f7` fields of the
   panel records (display format?) are not decoded.
-- Patch storage follow-ups: what ID 0xB7 / +0x67 is for, and whether anything outside the master's setter
+- Patch storage follow-ups: what ID 0xB7 / +0x67 is for (now blocking: Osc2 parameter 2 is planned there), and whether anything outside the master's setter
   touches it; the SysEx patch dump/receive format (is it the raw 128 bytes?); the panel's patch copy and its
   readers; the 4 × 0x8E-byte master records at 0x204439BC that the get/set switches iterate over; and the
   sequencer layout in master flash 0x49C000–0x4BA000.
-- Slave CPU headroom per block on each model (the main risk of the Carbon base).
+- Slave CPU headroom per block on each model (the main risk of the Carbon base), including the cost of a Cobalt alg at 96 kHz vs 48 kHz plus upsampling.
 - Find the oscillator/FX algorithm dispatch tables in master/slave (needed for porting an engine). Filters are
   mapped (see "Filters").
 - Free flash for injected code: images end at 0x456E00 (Argon panel), 0x486F80 (Argon master) and
