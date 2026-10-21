@@ -15,6 +15,20 @@ Inputs: `firmwares/{argon,cobalt,carbon}/*_{panel,master,slave}_*.syx` (Argon 3.
 Decoder/encoder: `tools/modal_fw.py` (decodes all 9 files with 0 checksum errors; re-encoding reproduces
 every file byte-for-byte).
 
+**Goal and base (decided 2026-10-21):** one firmware with the features of all three, built on **Carbon 1.1**.
+Carbon is the newest, but that isn't the reason. The reasons:
+- Carbon's unique features are modulation and voice-structure changes that span panel, master and slave:
+  LFO1–3 Transform, S+H Ramped/Slewed, per-osc Level and Contour, and Filter Warp. Moving them would be
+  harder than moving DSP engines in, since the filter engines are leaf functions (see "Filters").
+- Carbon already contains most of Cobalt: the third LFO, the "L" filters, SVF, Drift and the Keyboard menu.
+  It shares Cobalt's 48 kHz float voice path and its patch layout (see "Patch storage"). Carbon and Cobalt
+  share the most byte-identical code of any pair.
+- Its slave has ~181 KB of free RAM; Argon's has ~61 KB (see "Memory budget").
+
+Risks: (1) slave CPU headroom is unmeasured, and Carbon's 2× voice buffers probably make it the
+tightest of the three; (2) Argon features (int16 path, 44.1 kHz, stored wavetables, which Carbon doesn't
+contain) need adapting for any base; (3) Carbon's master has the least free RAM (~44 KB).
+
 ## SysEx container
 
 | Msg | Bytes |
@@ -89,7 +103,7 @@ addresses. App images start at 0x410000; the bootloader sits below.
 |---|---|---|---|
 | MCU (inferred) | SAM4E (AFEC @ 0x400B0000/0x400B4000, RAM end 0x2001FFFC) | SAM E70/S70, 1 MB flash, 384 KB SRAM | SAM E70/S70, 384 KB SRAM, ≥1 MB flash |
 | flash used by app | 0x410000–0x456D8C | 0x410000–0x486F7C | 0x410000–0x499B00 |
-| other flash use | user signature only | user storage 0x49C000–0x4FFFFF (factory reset erases it; patches 0x49C000–0x4BA000, settings 0x4FF000) | none seen |
+| other flash use | user signature only | user storage 0x49C000–0x4FFFFF (factory reset erases it; sequencer data 0x49C000–0x4BA000, settings 0x4FF000). Patches are **not** here: see "Patch storage" | none seen |
 | **free flash** | ≥164 KB (to 0x480000 on a 512 KB SAM4E8; ~676 KB if SAM4E16) | **84 KB** (0x486F80–0x49BFFF) | **~409 KB** (to 0x500000 if 1 MB) |
 | RAM used (data+bss+stack) | 0x20000000–0x20012B20 (stack 12 KB) | 0x20400000–0x2044ED50 (stack 8 KB) | 0x20400000–0x2044FD08 (stack 8 KB) |
 | fixed buffers near RAM top | none | 0x2045B000–0x2045FFFF (20 KB) | 0x2045F000–0x2045FFFF (4 KB) |
@@ -100,6 +114,119 @@ addresses. App images start at 0x410000; the bootloader sits below.
 computed from other bases can't be fully excluded. The master's 1 MB size comes from its factory-reset loop
 erasing up to exactly 0x500000. The slave's flash size is inferred (same family; its 630 KB image rules out
 512 KB parts). Whether the bootloader limits a component's size is unknown.
+
+**All three models.** Same method: the reset handler's `.data`/`.bss` literals; the initial SP is `.bss` end +
+8 KB on master and slave. Cobalt and Carbon have the same fixed buffers and `_sbrk` limits as Argon
+(master 0x2045AFFC / 0x2045B000+, slave 0x2045EFFC / 0x2045F000+). Masters assume user storage starts at
+0x49C000 in all three; slaves assume 1 MB flash.
+
+| | Argon 3.2 | Cobalt 2.1 | Carbon 1.1 |
+|---|---|---|---|
+| panel image / SP | 0x46E00 / 0x20012B20 | 0x3BE80 / 0x20010688 | 0x3CD80 / 0x20010898 |
+| master image / `.bss` end | 0x76F80 / 0x2044CD4C | 0x66580 / 0x2044C48C | 0x74E00 / 0x2044DFF0 |
+| master free RAM | ~48.7 KB | ~50.9 KB | **~44.0 KB** |
+| master free flash (to 0x49C000) | 84 KB | 150 KB | 92.5 KB |
+| slave image / `.bss` end | 0x89B00 / 0x2044DD04 | 0x47B00 / 0x2040DB6C | 0x5E980 / 0x2042FAA8 |
+| slave free RAM | ~60.7 KB | ~317 KB | **~181 KB** |
+| slave free flash (to 0x500000) | ~409 KB | ~674 KB | ~581 KB |
+
+Cobalt's master factory reset differs from the other two: its sequencer region is 0x49C000–0x4AA000, filled
+through a helper (0x446AF5) rather than copied page by page.
+
+## Patch storage (all three masters)
+
+**Where:** a 128 KB I2C EEPROM on the master's TWIHS0 (0x40018000). It's a 24M01-style part: 7-bit address
+`0x50 | A16`, two address bytes and 256-byte pages. Primitives (Argon 3.2): read byte 0x412F40, read buffer
+0x412F98, write byte 0x412FE0, write page 0x41363C, plus a write helper 0x4133AC. The constants below are
+the same in all three masters, so the EEPROM layout is shared.
+
+| EEPROM range | Contents |
+|---|---|
+| 0x00000–0x0F9FF | **500 patches × 128 B**, address = `idx << 7`, `idx = bank·100 + slot` (5 banks × 100) |
+| 0x0FA00–0x1193F | 500 patch names × 16 B, `(idx + 0xFA0) << 4` |
+| 0x11940–0x12FFC | other tables and settings (16-B records at 0x11942 + 16·n and 0x1281B + 16·n, a block at 0x11F83, single bytes 0x12E5B–0x12E9A, 0x12F00–0x12FFC). Not mapped further |
+| 0x13000–0x1FFFA | **no references found: ~52 KB apparently unused** |
+| 0x1FFFB–0x1FFFF | flag and version bytes |
+
+The factory reset rewrites only 0x11942–0x11F81 of the EEPROM (from a table in flash). It doesn't touch the
+patches.
+
+**Save path** (Argon 0x438A1A): 0x42AF7C copies the 128-byte edit buffer, **masking every byte with
+0x7F**, then writes it to `idx << 7` and the name to `(idx + 0xFA0) << 4`. So each byte carries 7 bits.
+Edit buffer: master RAM 0x2043A088 (Argon) / 0x2043A028 (Cobalt) / 0x2043B9E4 (Carbon). The slave keeps a
+copy with the **same offsets** (Carbon slave: 0x20413134; its setter switch is at 0x42972E). The panel has
+its own copy as well.
+
+**Mapping method:** parameter IDs come from the panel tables (Argon @ 0x453374, Cobalt @ 0x4483CC, Carbon
+@ 0x449234; 32-byte records `01 00 id16 min max f6 f7 grp name`). When `max` < `min`, the record is a bit
+field: `min` is the bit position. The ID → offset mapping comes from each master's parameter setter
+(`tbh` switch: Argon 0x42B8F4, Cobalt 0x43129C, Carbon 0x43183E) and getter (Argon 0x4384A4, Cobalt
+0x43DECE, Carbon 0x43DFE2).
+
+**Layout.** Bytes are the same in all three models unless a column says otherwise. Format: name (panel ID, range).
+
+| Offset | Argon 3.2 | Cobalt 2.1 | Carbon 1.1 |
+|---|---|---|---|
+| +00, +01 | Glide (0x05), Voice Mode (0x09) | = | = |
+| +02 | Distortion (0x0C) | Free Run (0xC3, 0–1) | Free Run (0xC3, 0–1) |
+| +03, +04 | Osc1 Tune, Fine (0x0E, 0x0F) | = | = |
+| +05 | Voice Drift (0x97) | Drift (0x97) | Drift (0x97) |
+| **+06, +07** | **Osc1/2 Wave** (0x10/0x11) | **Osc1/2 Param A** (0x10/0x11) | **Osc1/2 Contour** (0x10/0x11) |
+| +08 | Mix (0x12) | Mix (0x12) | XMod (0x12) |
+| **+09, +0A** | OscMod, Spread (0x13/0x14, shared) | **Osc1/2 Param B** (0x13/0x14) | Osc1/2 Level (0x13/0x14) |
+| +0B | Osc Mode (0x15, 0–112) | LFO3 Depth (0x0D) | LFO3 Depth (0x0D) |
+| +0C–+16 | AEG ADSR, FEG ADSR, Osc2 Tune/Fine, AEG Amount | = | = |
+| +17–+19 | Filter Morph / Cutoff / Reso (0x21–0x23) | = | Warp / Cutoff / Reso |
+| +1A–+26 | LFO1 Rate/Depth/Shape, FEG Amt, Octave, MEG ADSR, LFO2 Rate/Depth/Shape, MEG Amt | = (shape max 108) | = (shape max 126) |
+| +27 | LFO1 Sync (0x34) | LFO1/2/3 Sync, bits 0/1/2 (0x34) | same as Cobalt |
+| +28 | LFO2 Sync (0x36) | LFO3 Mode (0x36, 0–84) | LFO1/2/3 Mode, 2 bits each at bits 0/2/4 (0x36) |
+| +29 | FX Clock Sync (0x37) | = | = |
+| +2A, +2B | LFO1/2 Mode (0x38/0x39, 0–84) | = | **LFO1/2 Transform** (0x38/0x39) |
+| +2C–+30 | Arp Status, Octave (0–3), Direction (0–14), Division (0–15), Swing | = | = |
+| **+31, +32** | **Osc1/2 Bank** (0x3E 0–35, 0x3F 0–126) | **Osc1/2 Alg** (0x3E/0x3F, 0–39) | **Osc1/2 Core** (0x3E/0x3F, 0–55) |
+| +33 | Filter Type (0x2A, 0–7) | 0–30 | 0–33 |
+| +34–+36 | FEG/AEG/MEG Type (0x50–0x52, 0–7) | = | = |
+| +37, +38, +39 | Out Level (0x49), Chord Invert (0xBD, 0–36), Patch Gain (0x77) | = | = |
+| +3A–+4F | FX Mode (0x29, 0–2), then 3 × FX {Type 0–26, A–F} (0x80–0x94) | = | = |
+| +50–+5C | Note/Velo/AftT/Expr Depth, X+/X−/Y+/Y− Depth, Note>Cutoff, Y+>LFO1, AftT>Cutoff, Velo>AEG, Arp Gate | = | = |
+| +5D | Pitch Bend (0x99) | = | = |
+| +5E, +5F | **Osc1/2 WavMod** (0x03/0x0D, 0–32) | Voice Width (0x98), Linked Sequence (0xB6) | same as Cobalt |
+| +60, +61 | Voice Width (0x98), Linked Sequence (0xB6) | LFO3 Rate (0x03), Shape (0x15) | same as Cobalt |
+| +62 | Osc2 Tune Mode (0xC2, 0–1) | Vintage (0xC4) | Vintage (0xC4) |
+| +63 | Free Run (0xC3) | Cutoff Scaling (0xC5, 0–2) | Cutoff Scaling (0xC5, 0–1) |
+| +64 | Vintage (0xC4) | **unused** | LFO3 Transform (0x0C) |
+| +65 | Cutoff Scaling (0xC5) | **unused** | XCore (0xC6, 0–5) |
+| **+66** | **unused** | **unused** | **unused** |
+| +67 | ID 0xB7 (no panel record) | = | = |
+| +68–+7F | mod matrix: 8 slots × 3 bytes (Source/Dest/Depth, IDs 0x58–0x73) | = | = |
+
+- **+0x66 is free in all three.** No master or slave code reads or writes it through the edit-buffer base.
+  It is still saved, so stock patches hold 0 there.
+- **+0x67** is written by the master setter for ID 0xB7. The slave setter ignores 0xB7 (default case), and
+  no master code reads +0x67. No panel record exists. It may be dead, or used only by SysEx/the editor app.
+  Unverified.
+- Audio In → FX (0x95), XY Lock (0x9A) and Audio In Volume (0x53) are global RAM variables, not patch
+  bytes, even though the same setter handles them.
+- Modal already bit-packs in Cobalt/Carbon (+0x27, +0x28), and the panel record format supports bit fields.
+  Many bytes have spare high bits: +0x02 and +0x63 (0–1), the EG types (0–7), FX Mode (0–2), Arp
+  Octave/Direction/Division, and XCore (0–5). Using them means masking in every master, slave and panel
+  reader of that byte.
+
+**Oscillator type and parameters on a Carbon base** (what has to fit, 7 bits per byte):
+- Type: the three models use the same bytes, +0x31/+0x32. Carbon has 56 Cores, Cobalt 40 Algs, and Argon
+  36 banks plus 4 Osc2-only noise/PWM types, so 136 values per oscillator, more than 7 bits. Options:
+  (a) a family selector, 2 bits per oscillator, in +0x66; stock patches read 0 = Carbon; or (b) one flat
+  list 0–127 (Carbon 0–55, Cobalt 56–95, Argon 96–127), which leaves out 8 of Argon's 40 entries.
+- Parameter 1 per osc fits in +0x06/+0x07 (Contour / Param A / Wave), interpreted per engine.
+- **Parameter 2 per osc** (Cobalt Param B 0–127, Argon WavMod 0–32): Carbon uses +0x09/+0x0A for Level,
+  which has to stay. This needs 2 × 7 bits that the record doesn't have spare. With (a) the total is 18
+  bits; with (b) it is 14. Supply: +0x66 (7 bits, verified free), +0x67 (7 bits if ID 0xB7 is dead), and
+  spare high bits. So (b) fits exactly in +0x66/+0x67. (a) also needs 4 bits taken from a 0–1 or 0–7 byte.
+- Fallback that keeps the 128-byte record: an extension table (e.g. 500 × 4 B) in the unused EEPROM range
+  0x13000+. Load, save, copy/swap and SysEx dump/receive all need hooking, and dumps lose the data unless
+  the SysEx format is extended too.
+- Argon's other oscillator controls (Osc Mode 0–112, OscMod, Spread, Mix, Osc2 Tune Mode) overlap Carbon's
+  XMod/XCore and aren't counted above.
 
 ## Argon8 wavetables (slave 3.2)
 
@@ -310,8 +437,14 @@ needs code in the DSP images, the panel parameter/name tables, and the panel↔D
 
 ## Open questions
 
-- Map the panel↔master link (UART/I2C framing, `F0 00 21 07 <dev> …` command set) and the parameter ID space.
-- Find the parameter tables (name, range, display format) in the panel and the matching dispatch in the master.
+- Map the panel↔master link (UART/I2C framing, `F0 00 21 07 <dev> …` command set). The parameter ID space
+  and the master's ID → patch-byte dispatch are mapped (see "Patch storage"). The `f6`/`f7` fields of the
+  panel records (display format?) are not decoded.
+- Patch storage follow-ups: what ID 0xB7 / +0x67 is for, and whether anything outside the master's setter
+  touches it; the SysEx patch dump/receive format (is it the raw 128 bytes?); the panel's patch copy and its
+  readers; the 4 × 0x8E-byte master records at 0x204439BC that the get/set switches iterate over; and the
+  sequencer layout in master flash 0x49C000–0x4BA000.
+- Slave CPU headroom per block on each model (the main risk of the Carbon base).
 - Find the oscillator/FX algorithm dispatch tables in master/slave (needed for porting an engine). Filters are
   mapped (see "Filters").
 - Free flash for injected code: images end at 0x456E00 (Argon panel), 0x486F80 (Argon master) and
